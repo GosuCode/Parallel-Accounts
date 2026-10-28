@@ -4,36 +4,6 @@
 const CONTAINER_COLORS = ["blue", "green", "purple", "orange", "red", "pink"];
 const BADGE_COLORS = ["#3B82F6", "#10B981", "#8B5CF6", "#F59E0B", "#EF4444", "#EC4899"];
 
-// Map tab IDs to profile IDs so a content script can ask for its credentials.
-// Kept in storage.session so it survives event-page suspension.
-const TAB_PROFILES_KEY = "activeTabProfiles";
-let tabProfilesCache = null;
-
-async function getTabProfiles() {
-  if (!tabProfilesCache) {
-    const res = await browser.storage.session.get(TAB_PROFILES_KEY);
-    tabProfilesCache = res[TAB_PROFILES_KEY] || {};
-  }
-  return tabProfilesCache;
-}
-
-async function setTabProfile(tabId, profileId) {
-  const map = await getTabProfiles();
-  map[tabId] = profileId;
-  await browser.storage.session.set({ [TAB_PROFILES_KEY]: map });
-}
-
-async function getTabProfile(tabId) {
-  const map = await getTabProfiles();
-  return map[tabId];
-}
-
-async function removeTabProfile(tabId) {
-  const map = await getTabProfiles();
-  delete map[tabId];
-  await browser.storage.session.set({ [TAB_PROFILES_KEY]: map });
-}
-
 const containersDisabled = () =>
   !browser.contextualIdentities || !browser.cookies;
 
@@ -46,6 +16,15 @@ async function getProfiles() {
 
 async function saveProfiles(profiles) {
   await browser.storage.local.set({ profiles });
+}
+
+// Each profile owns exactly one container, so a tab's cookieStoreId identifies
+// its profile. Unlike a tab-ID map this survives browser restarts, session
+// restore, and new tabs opened from inside the container.
+async function findProfileByCookieStore(cookieStoreId) {
+  if (!cookieStoreId) return null;
+  const profiles = await getProfiles();
+  return Object.values(profiles).find((p) => p.cookieStoreId === cookieStoreId) || null;
 }
 
 async function trySilently(fn) {
@@ -204,12 +183,18 @@ async function resetVault() {
 // No key cached (vault locked or never unlocked this session): skip
 // silently, the page just doesn't get autofilled until the user
 // unlocks the vault from the popup.
-async function handleGetCredentials(tabId) {
-  const profileId = await getTabProfile(tabId);
-  if (!profileId) return null;
+async function handleGetCredentials(sender) {
+  const tab = sender && sender.tab;
+  if (!tab) return null;
 
-  const profile = (await getProfiles())[profileId];
+  const profile = await findProfileByCookieStore(tab.cookieStoreId);
   if (!profile) return null;
+
+  // Only hand credentials to the profile's own site, even if the container
+  // tab has since navigated elsewhere.
+  if (!profile.domain || !sameSite(hostnameOf(sender.url || tab.url), profile.domain)) {
+    return null;
+  }
 
   const key = await getCachedKey();
   let password = "";
@@ -252,7 +237,7 @@ const messageHandlers = {
   EDIT_PROFILE: (message) =>
     handleEditProfile(message.profileId, message.name, message.email, message.password, message.url),
   DELETE_PROFILE: (message) => handleDeleteProfile(message.profileId),
-  GET_CREDENTIALS: (message, sender) => handleGetCredentials(sender.tab && sender.tab.id),
+  GET_CREDENTIALS: (message, sender) => handleGetCredentials(sender),
   GET_PROFILE_PASSWORD: (message) => handleGetProfilePassword(message.profileId),
   VAULT_STATUS: () => handleVaultStatus(),
   VAULT_SETUP: (message) => setupVault(message.password).then(() => ({ success: true })),
@@ -288,6 +273,12 @@ function hostnameOf(url) {
   } catch (e) {
     return "";
   }
+}
+
+function sameSite(host, domain) {
+  if (!host || !domain) return false;
+  const strip = (h) => h.replace(/^www\./i, "").toLowerCase();
+  return strip(host) === strip(domain) || host.toLowerCase().endsWith("." + domain.toLowerCase());
 }
 
 function originOf(url) {
@@ -361,7 +352,6 @@ async function handleCreateProfile(name, email, password, url) {
   await saveProfiles(profiles);
 
   const tab = await browser.tabs.create({ url: profile.url, cookieStoreId: profile.cookieStoreId });
-  await setTabProfile(tab.id, profile.id);
   updateTabBadge(tab.id, profile.name, profile.color);
 
   return { success: true, profileId: profile.id, tabId: tab.id };
@@ -567,26 +557,27 @@ async function handleLaunchProfile(profileId) {
   const targetUrl =
     profile.url || (profile.domain ? `https://${profile.domain}` : "about:blank");
   const tab = await browser.tabs.create({ url: targetUrl, cookieStoreId: profile.cookieStoreId });
-  await setTabProfile(tab.id, profileId);
   updateTabBadge(tab.id, profile.name, profile.color);
 
   return { success: true, tabId: tab.id };
 }
 
-// Edit an existing profile's details
+// Edit an existing profile's details. A null password means "leave the saved
+// password as is" (the popup couldn't load it); "" clears it.
 async function handleEditProfile(profileId, name, email, password, url) {
   const profiles = await getProfiles();
   const profile = profiles[profileId];
   if (!profile) return { success: false, error: "not-found" };
 
-  const key = await getCachedKey();
-  if (!key) return { success: false, error: "vault-locked" };
-
   const baseUrl = originOf(url) || url;
+  if (password !== null) {
+    const key = await getCachedKey();
+    if (!key) return { success: false, error: "vault-locked" };
+    profile.passwordEnc = await encryptPasswordIfProvided(key, password);
+    delete profile.password;
+  }
   profile.name = name;
   profile.email = email || "";
-  profile.passwordEnc = await encryptPasswordIfProvided(key, password);
-  delete profile.password;
   profile.url = baseUrl;
   profile.domain = hostnameOf(baseUrl);
 
@@ -627,14 +618,35 @@ async function handleDeleteProfile(profileId) {
   return { success: true, profileId };
 }
 
-// Update visual badge on tab icon
-function updateTabBadge(tabId, text, color) {
-  const shortText = text.slice(0, 4).toUpperCase();
-  browser.action.setBadgeText({ tabId, text: shortText });
-  browser.action.setBadgeBackgroundColor({ tabId, color });
+// Short badge label that keeps similar names apart: "Account 1" -> "A1",
+// "Account 12" -> "A12", "Work Gmail" -> "WG", "Personal" -> "PERS".
+function badgeLabel(name) {
+  const words = String(name || "").trim().split(/[\s_.-]+/).filter(Boolean);
+  if (words.length === 0) return "";
+  if (words.length === 1) return words[0].slice(0, 4).toUpperCase();
+
+  const last = words[words.length - 1];
+  const numbered = /^\d+$/.test(last);
+  const initials = (numbered ? words.slice(0, -1) : words).map((w) => w[0]).join("");
+  return (initials + (numbered ? last : "")).slice(0, 4).toUpperCase();
 }
 
-// Drop the tab -> profile mapping when a tab closes.
-browser.tabs.onRemoved.addListener((tabId) => {
-  removeTabProfile(tabId);
-});
+// Update visual badge on tab icon
+function updateTabBadge(tabId, text, color) {
+  // Tab may already be closed by the time this runs; nothing to do then.
+  browser.action.setBadgeText({ tabId, text: badgeLabel(text) }).catch(() => {});
+  browser.action.setBadgeBackgroundColor({ tabId, color }).catch(() => {});
+}
+
+// Firefox resets per-tab badges on navigation, so reapply whenever a
+// container tab starts or finishes loading. Also covers tabs restored at
+// browser startup.
+browser.tabs.onUpdated.addListener(
+  async (tabId, changeInfo, tab) => {
+    const store = tab.cookieStoreId;
+    if (!store || store.startsWith("firefox-")) return;
+    const profile = await findProfileByCookieStore(store);
+    if (profile) updateTabBadge(tabId, profile.name, profile.color);
+  },
+  { properties: ["status"] }
+);

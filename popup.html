@@ -16,6 +16,9 @@
       --danger-bg: #fef2f2;
       --danger-border: #fecaca;
       --danger-fg: #b91c1c;
+      --ok-bg: #f0fdf4;
+      --ok-border: #bbf7d0;
+      --ok-fg: #15803d;
     }
     * { box-sizing: border-box; }
     body {
@@ -228,6 +231,17 @@
       font-size: 11.5px;
     }
     .launch:hover { background: var(--soft-hover); }
+    .confirm-delete {
+      background: var(--danger-fg);
+      color: #fff;
+      padding: 5px 10px;
+      font-size: 11.5px;
+    }
+    .confirm-delete:hover { background: #991b1b; }
+    .profile-meta.warn {
+      color: var(--danger-fg);
+      white-space: normal;
+    }
     .icon-btn {
       display: flex;
       align-items: center;
@@ -304,6 +318,11 @@
       font-size: 11.5px;
       line-height: 1.4;
       margin-bottom: 12px;
+    }
+    .toast.success {
+      background: var(--ok-bg);
+      border-color: var(--ok-border);
+      color: var(--ok-fg);
     }
     .toast-msg { flex: 1; word-break: break-word; }
     .toast-close {
@@ -404,8 +423,8 @@
       <label>Profile name
         <input type="text" id="profileName" placeholder="Account 1" autocomplete="off">
       </label>
-      <label>Email
-        <input type="email" id="email" placeholder="you@example.com" autocomplete="off">
+      <label>Email or username
+        <input type="text" id="email" placeholder="you@example.com" autocomplete="off" autocapitalize="off" spellcheck="false">
       </label>
       <label>Password
         <span class="pw">
@@ -425,7 +444,7 @@
         </span>
       </label>
       <label>URL
-        <input type="url" id="url" placeholder="https://example.com" autocomplete="off">
+        <input type="text" inputmode="url" id="url" placeholder="example.com" autocomplete="off" autocapitalize="off" spellcheck="false">
       </label>
       <button type="submit" class="primary" id="createBtn">Create profile</button>
       <button type="button" class="secondary" id="cancelBtn">← Back</button>

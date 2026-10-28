@@ -124,7 +124,9 @@
   }
 
   chrome.runtime.sendMessage({ action: "GET_CREDENTIALS" }, (credentials) => {
-    if (chrome.runtime.lastError) return;
+    // Null for every tab that isn't a saved profile's container: stop here
+    // so ordinary browsing never pays for the retry timer or DOM observer.
+    if (chrome.runtime.lastError || !credentials) return;
     attempt(credentials);
   });
 })();

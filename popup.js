@@ -61,8 +61,9 @@ document.addEventListener("DOMContentLoaded", async () => {
   }
 
   let toastTimer = null;
-  function showToast(message) {
+  function showToast(message, type = "error") {
     toastMsg.textContent = message;
+    toast.classList.toggle("success", type === "success");
     toast.hidden = false;
     clearTimeout(toastTimer);
     toastTimer = setTimeout(() => { toast.hidden = true; }, 6000);
@@ -73,6 +74,10 @@ document.addEventListener("DOMContentLoaded", async () => {
   });
 
   let editingId = null;
+  // True while editing a profile whose saved password couldn't be loaded
+  // into the form; leaving the field blank then means "keep it", not "clear it".
+  let keepExistingPassword = false;
+  let pendingDeleteId = null;
   let allProfiles = {};
   let vaultReady = false;
   let formOpen = false;
@@ -177,7 +182,7 @@ document.addEventListener("DOMContentLoaded", async () => {
       await refreshVaultUI();
       return;
     }
-    showToast("Vault reset. Saved passwords were removed — set a new master password to add new ones.");
+    showToast("Vault reset. Saved passwords were removed — set a new master password to add new ones.", "success");
     await refreshVaultUI();
     loadProfiles();
   });
@@ -253,7 +258,7 @@ document.addEventListener("DOMContentLoaded", async () => {
         return;
       }
       downloadCsv(res.csv);
-      showToast(`Exported ${res.count} profile(s).`);
+      showToast(`Exported ${res.count} profile(s).`, "success");
     } else {
       const file = importFileInput.files[0];
       if (!file) {
@@ -272,7 +277,10 @@ document.addEventListener("DOMContentLoaded", async () => {
       if (dupeCount) parts.push(`${dupeCount} duplicate${dupeCount === 1 ? "" : "s"} skipped`);
       if (otherFailCount) parts.push(`${otherFailCount} failed`);
       const failedPart = parts.length ? `, ${parts.join(", ")}` : "";
-      showToast(`Imported ${res.imported}/${res.total} profile(s)${failedPart}.`);
+      showToast(
+        `Imported ${res.imported}/${res.total} profile(s)${failedPart}.`,
+        res.imported > 0 ? "success" : "error"
+      );
       loadProfiles();
       if (standaloneImport) {
         // Brief pause so the toast is readable before the window vanishes.
@@ -305,6 +313,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   // existing origin) when opening it for a brand-new profile.
   async function openForm(prefillUrl) {
     editingId = null;
+    keepExistingPassword = false;
     form.reset();
     if (prefillUrl) urlInput.value = prefillUrl;
     createBtn.textContent = "Create profile";
@@ -317,6 +326,7 @@ document.addEventListener("DOMContentLoaded", async () => {
 
   function closeForm() {
     editingId = null;
+    keepExistingPassword = false;
     form.reset();
     createBtn.textContent = "Create profile";
     formHeading.textContent = "New profile";
@@ -327,6 +337,7 @@ document.addEventListener("DOMContentLoaded", async () => {
 
   async function editProfile(profile) {
     editingId = profile.id;
+    keepExistingPassword = Boolean(profile.passwordEnc);
     nameInput.value = profile.name || "";
     emailInput.value = profile.email || "";
     passwordInput.value = "";
@@ -342,6 +353,7 @@ document.addEventListener("DOMContentLoaded", async () => {
       const res = await sendMessage({ action: "GET_PROFILE_PASSWORD", profileId: profile.id });
       if (res && res.success) {
         passwordInput.value = res.password;
+        keepExistingPassword = false;
       } else {
         showToast("Vault is locked. Unlock it to edit the saved password.");
       }
@@ -545,13 +557,14 @@ document.addEventListener("DOMContentLoaded", async () => {
     chrome.runtime.sendMessage({ action: "LAUNCH_PROFILE", profileId }, (response) => reportError(response));
   }
 
+  // Deleting is two-step and inline: the trash button swaps the row into a
+  // "Cancel / Delete" state that spells out the consequences.
   function deleteProfile(profile) {
-    if (!confirm(`Delete profile "${profile.name}"? This closes its tabs and removes the saved password.`)) {
-      return;
-    }
     chrome.runtime.sendMessage({ action: "DELETE_PROFILE", profileId: profile.id }, (response) => {
+      pendingDeleteId = null;
       if (!response || !response.success) {
         reportError(response);
+        renderProfiles();
         return;
       }
       delete allProfiles[profile.id];
@@ -664,7 +677,13 @@ document.addEventListener("DOMContentLoaded", async () => {
         name.textContent = p.name;
         text.appendChild(name);
 
-        if (p.email) {
+        const confirmingDelete = pendingDeleteId === p.id;
+        if (confirmingDelete) {
+          const meta = document.createElement("div");
+          meta.className = "profile-meta warn";
+          meta.textContent = "Closes its tabs, logs out this account, and deletes the saved password.";
+          text.appendChild(meta);
+        } else if (p.email) {
           const meta = document.createElement("div");
           meta.className = "profile-meta";
           meta.textContent = p.email;
@@ -677,6 +696,28 @@ document.addEventListener("DOMContentLoaded", async () => {
 
         const actions = document.createElement("div");
         actions.className = "actions";
+
+        if (confirmingDelete) {
+          const cancel = document.createElement("button");
+          cancel.type = "button";
+          cancel.className = "launch";
+          cancel.textContent = "Cancel";
+          cancel.addEventListener("click", () => {
+            pendingDeleteId = null;
+            renderProfiles();
+          });
+
+          const confirmBtn = document.createElement("button");
+          confirmBtn.type = "button";
+          confirmBtn.className = "confirm-delete";
+          confirmBtn.textContent = "Delete";
+          confirmBtn.addEventListener("click", () => deleteProfile(p));
+
+          actions.append(cancel, confirmBtn);
+          row.appendChild(actions);
+          itemsEl.appendChild(row);
+          return;
+        }
 
         const edit = document.createElement("button");
         edit.className = "icon-btn edit";
@@ -695,7 +736,10 @@ document.addEventListener("DOMContentLoaded", async () => {
         del.title = "Delete";
         del.setAttribute("aria-label", "Delete");
         del.appendChild(buildTrashIcon());
-        del.addEventListener("click", () => deleteProfile(p));
+        del.addEventListener("click", () => {
+          pendingDeleteId = p.id;
+          renderProfiles();
+        });
 
         actions.append(edit, launch, del);
         row.appendChild(actions);
@@ -731,7 +775,10 @@ document.addEventListener("DOMContentLoaded", async () => {
     });
   }
 
-  searchInput.addEventListener("input", renderProfiles);
+  searchInput.addEventListener("input", () => {
+    pendingDeleteId = null;
+    renderProfiles();
+  });
 
   function reportError(response) {
     if (!response || response.success !== false) return;
@@ -754,7 +801,8 @@ document.addEventListener("DOMContentLoaded", async () => {
 
     const name = nameInput.value.trim();
     const email = emailInput.value.trim();
-    const password = passwordInput.value;
+    // null tells the background to keep the saved password untouched.
+    const password = editingId && keepExistingPassword && !passwordInput.value ? null : passwordInput.value;
     const url = normalizeBaseUrl(urlInput.value);
 
     if (!name) {
