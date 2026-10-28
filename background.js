@@ -316,11 +316,23 @@ function nextProfileId() {
   return `prof_${Date.now()}_${profileIdCounter}`;
 }
 
+// Picks the palette color used by the fewest existing profiles so new
+// profiles stay visually distinct (first match wins ties).
+function pickColorIndex(profiles) {
+  const counts = CONTAINER_COLORS.map(() => 0);
+  for (const profile of Object.values(profiles)) {
+    const i = CONTAINER_COLORS.indexOf(profile.containerColor);
+    if (i !== -1) counts[i]++;
+  }
+  return counts.indexOf(Math.min(...counts));
+}
+
 // Builds a stored profile record (container + encrypted password), shared
 // by single-profile creation and bulk import. Does not open a tab.
-async function buildProfileRecord({ name, email, password, url, key }) {
+// `profiles` is the current set, used to choose an unused color.
+async function buildProfileRecord({ name, email, password, url, key, profiles }) {
   const baseUrl = originOf(url) || url;
-  const index = Math.floor(Math.random() * CONTAINER_COLORS.length);
+  const index = pickColorIndex(profiles);
   const cookieStoreId = await createContainer(name, CONTAINER_COLORS[index]);
 
   return {
@@ -345,9 +357,9 @@ async function handleCreateProfile(name, email, password, url) {
   const key = await getCachedKey();
   if (!key) return { success: false, error: "vault-locked" };
 
-  const profile = await buildProfileRecord({ name, email, password, url, key });
-
   const profiles = await getProfiles();
+  const profile = await buildProfileRecord({ name, email, password, url, key, profiles });
+
   profiles[profile.id] = profile;
   await saveProfiles(profiles);
 
@@ -510,8 +522,15 @@ async function importProfiles(password, csvText) {
   );
 
   for (const row of rows) {
-    const name = row.name || row.url || "Imported profile";
-    const key = dedupeKey(name, row.username, row.url);
+    // Skip before creating a container: rows without a usable http(s) URL
+    // (blank, app entries like android://...) can't be launched or autofilled.
+    const url = originOf(/^[a-z][a-z0-9+.-]*:\/\//i.test(row.url || "") ? row.url : `https://${row.url || ""}`);
+    const name = row.name || hostnameOf(url) || "Imported profile";
+    if (!row.url || !url) {
+      errors.push({ row: name, error: "no-url" });
+      continue;
+    }
+    const key = dedupeKey(name, row.username, url);
     if (seen.has(key)) {
       errors.push({ row: name, error: "duplicate" });
       continue;
@@ -521,8 +540,9 @@ async function importProfiles(password, csvText) {
         name,
         email: row.username,
         password: row.password,
-        url: row.url,
-        key: verify.key
+        url,
+        key: verify.key,
+        profiles
       });
       profiles[profile.id] = profile;
       seen.add(key);

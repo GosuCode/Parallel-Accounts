@@ -88,11 +88,38 @@ document.addEventListener("DOMContentLoaded", async () => {
     return new Promise((resolve) => chrome.runtime.sendMessage(payload, resolve));
   }
 
+  // Disables a submit button and swaps its label while a slow step runs
+  // (master-password key derivation takes a noticeable moment), so the popup
+  // doesn't look frozen and can't be double-submitted.
+  async function withBusy(button, busyLabel, task) {
+    const idleLabel = button.textContent;
+    button.disabled = true;
+    button.textContent = busyLabel;
+    try {
+      return await task();
+    } finally {
+      button.disabled = false;
+      button.textContent = idleLabel;
+    }
+  }
+
   // Switches between the profiles list and the create/edit form as two full
   // views of the popup, rather than showing both stacked at once.
   function updateFormPanelVisibility() {
     formPanel.hidden = !(vaultReady && formOpen);
     if (vaultReady) profilesSection.hidden = formOpen;
+  }
+
+  // Puts the cursor where the user will type next: the master password when
+  // the vault needs one, otherwise the profile search.
+  function focusPrimary() {
+    if (!vaultSetupSection.hidden) {
+      document.getElementById("vaultNewPassword").focus();
+    } else if (!vaultLockedSection.hidden) {
+      document.getElementById("vaultUnlockPassword").focus();
+    } else if (!profilesSection.hidden) {
+      searchInput.focus();
+    }
   }
 
   // Reflects vault state in the UI and gates the create/edit form on it —
@@ -113,6 +140,7 @@ document.addEventListener("DOMContentLoaded", async () => {
     vaultReady = exists && unlocked;
     if (locked) closeForm();
     updateFormPanelVisibility();
+    focusPrimary();
     return vaultReady;
   }
 
@@ -128,7 +156,11 @@ document.addEventListener("DOMContentLoaded", async () => {
       showToast("Passwords do not match.");
       return;
     }
-    const res = await sendMessage({ action: "VAULT_SETUP", password: pw });
+    const res = await withBusy(
+      vaultSetupForm.querySelector('button[type="submit"]'),
+      "Setting up…",
+      () => sendMessage({ action: "VAULT_SETUP", password: pw })
+    );
     if (!res || !res.success) {
       showToast("Could not set master password.");
       return;
@@ -141,7 +173,11 @@ document.addEventListener("DOMContentLoaded", async () => {
   vaultUnlockForm.addEventListener("submit", async (event) => {
     event.preventDefault();
     const pw = document.getElementById("vaultUnlockPassword").value;
-    const res = await sendMessage({ action: "VAULT_UNLOCK", password: pw });
+    const res = await withBusy(
+      vaultUnlockForm.querySelector('button[type="submit"]'),
+      "Unlocking…",
+      () => sendMessage({ action: "VAULT_UNLOCK", password: pw })
+    );
     if (!res || !res.success) {
       showToast(res && res.error === "wrong-password" ? "Incorrect master password." : "Could not unlock vault.");
       return;
@@ -165,6 +201,7 @@ document.addEventListener("DOMContentLoaded", async () => {
     vaultResetSection.hidden = false;
     vaultResetInput.value = "";
     vaultResetConfirmBtn.disabled = true;
+    vaultResetInput.focus();
   });
 
   vaultResetInput.addEventListener("input", () => {
@@ -197,7 +234,7 @@ document.addEventListener("DOMContentLoaded", async () => {
     vaultActionTitle.textContent = mode === "export" ? "Export profiles" : "Import profiles";
     vaultActionHint.textContent =
       mode === "export"
-        ? "Re-enter your master password to decrypt and export saved passwords as a CSV file."
+        ? "Re-enter your master password to export your profiles as a CSV file. The file contains your passwords in plain text, so delete it when you're done."
         : "Choose a CSV file (name, url, username, password) and re-enter your master password to import.";
     // Import always shows the file picker — export never shows it at all.
     importFileLabel.hidden = mode !== "import";
@@ -208,6 +245,7 @@ document.addEventListener("DOMContentLoaded", async () => {
     profilesSection.hidden = true;
     formPanel.hidden = true;
     vaultActionSection.hidden = false;
+    (mode === "import" ? importFileInput : vaultActionPassword).focus();
   }
 
   exportBtn.addEventListener("click", () => openVaultAction("export"));
@@ -252,13 +290,15 @@ document.addEventListener("DOMContentLoaded", async () => {
     }
 
     if (vaultActionMode === "export") {
-      const res = await sendMessage({ action: "VAULT_EXPORT", password });
+      const res = await withBusy(vaultActionSubmitBtn, "Exporting…", () =>
+        sendMessage({ action: "VAULT_EXPORT", password })
+      );
       if (!res || !res.success) {
         showToast(res && res.error === "wrong-password" ? "Incorrect master password." : "Could not export profiles.");
         return;
       }
       downloadCsv(res.csv);
-      showToast(`Exported ${res.count} profile(s).`, "success");
+      showToast(`Exported ${res.count} profile(s). The file has plain-text passwords, so delete it after use.`, "success");
     } else {
       const file = importFileInput.files[0];
       if (!file) {
@@ -266,15 +306,20 @@ document.addEventListener("DOMContentLoaded", async () => {
         return;
       }
       const csvText = await file.text();
-      const res = await sendMessage({ action: "VAULT_IMPORT", password, csvText });
+      const res = await withBusy(vaultActionSubmitBtn, "Importing…", () =>
+        sendMessage({ action: "VAULT_IMPORT", password, csvText })
+      );
       if (!res || !res.success) {
         showToast(res && res.error === "wrong-password" ? "Incorrect master password." : "Could not import profiles.");
         return;
       }
-      const dupeCount = res.errors ? res.errors.filter((e) => e.error === "duplicate").length : 0;
-      const otherFailCount = res.errors ? res.errors.length - dupeCount : 0;
+      const errors = res.errors || [];
+      const dupeCount = errors.filter((e) => e.error === "duplicate").length;
+      const noUrlCount = errors.filter((e) => e.error === "no-url").length;
+      const otherFailCount = errors.length - dupeCount - noUrlCount;
       const parts = [];
       if (dupeCount) parts.push(`${dupeCount} duplicate${dupeCount === 1 ? "" : "s"} skipped`);
+      if (noUrlCount) parts.push(`${noUrlCount} skipped without a valid URL`);
       if (otherFailCount) parts.push(`${otherFailCount} failed`);
       const failedPart = parts.length ? `, ${parts.join(", ")}` : "";
       showToast(
@@ -333,7 +378,29 @@ document.addEventListener("DOMContentLoaded", async () => {
     resetPasswordVisibility();
     formOpen = false;
     updateFormPanelVisibility();
+    focusPrimary();
   }
+
+  // Esc steps back one level (cancel delete, close form, leave a vault
+  // panel) instead of closing the whole popup. At the top level it falls
+  // through to Firefox's default.
+  document.addEventListener("keydown", (event) => {
+    if (event.key !== "Escape") return;
+
+    if (pendingDeleteId) {
+      pendingDeleteId = null;
+      renderProfiles();
+    } else if (formOpen) {
+      closeForm();
+    } else if (!vaultActionSection.hidden && !standaloneImport) {
+      refreshVaultUI();
+    } else if (!vaultResetSection.hidden) {
+      refreshVaultUI();
+    } else {
+      return;
+    }
+    event.preventDefault();
+  });
 
   async function editProfile(profile) {
     editingId = profile.id;
@@ -814,13 +881,16 @@ document.addEventListener("DOMContentLoaded", async () => {
       return;
     }
 
+    const idleLabel = createBtn.textContent;
     createBtn.disabled = true;
+    createBtn.textContent = editingId ? "Saving…" : "Creating…";
     const payload = editingId
       ? { action: "EDIT_PROFILE", profileId: editingId, name, email, password, url }
       : { action: "CREATE_PROFILE", profileName: name, email, password, url };
 
     chrome.runtime.sendMessage(payload, (response) => {
       createBtn.disabled = false;
+      createBtn.textContent = idleLabel;
       reportError(response);
       if (response && response.success) {
         closeForm();

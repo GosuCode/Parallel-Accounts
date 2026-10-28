@@ -21,6 +21,9 @@
       --ok-fg: #15803d;
     }
     * { box-sizing: border-box; }
+    /* Author display rules (e.g. .vault-bar { display: flex }) would otherwise
+       override the hidden attribute and leave "hidden" elements visible. */
+    [hidden] { display: none !important; }
     body {
       width: 320px;
       margin: 0;
@@ -303,7 +306,17 @@
       font-size: 11px;
       white-space: nowrap;
     }
-    .full-link { margin-top: 14px; }
+    /* Pinned to the bottom of the popup so it stays reachable however long
+       the profile list gets; the list scrolls underneath it. */
+    .create-bar {
+      position: sticky;
+      bottom: 0;
+      margin-top: 6px;
+      padding: 10px 0 12px;
+      background: var(--bg);
+      border-top: 1px solid var(--line);
+    }
+    .create-bar .primary { margin-top: 0; }
     .form-panel { margin-top: 14px; }
     .toast[hidden] { display: none; }
     .toast {
@@ -414,7 +427,9 @@
     </label>
     <div id="profileList"></div>
 
-    <button type="button" id="createForCurrentBtn" class="primary full-link">+ Create new profile for current site</button>
+    <div class="create-bar">
+      <button type="button" id="createForCurrentBtn" class="primary">+ Create new profile for current site</button>
+    </div>
   </div>
 
   <div id="createFormPanel" class="form-panel" hidden>
